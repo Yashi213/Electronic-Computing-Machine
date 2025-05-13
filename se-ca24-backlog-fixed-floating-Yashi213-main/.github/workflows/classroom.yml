@@ -1,0 +1,337 @@
+name: CI/CD
+
+on:
+  create:
+  repository_dispatch: 
+  workflow_dispatch:  
+    inputs:
+      toward_zero:
+        description: "Округление к 0"
+        default: true
+        type: boolean
+      toward_nearest_even:
+        description: "Округление к ближайшему чётному"
+        default: false
+        type: boolean
+      toward_pinf:
+        description: "Округление к +inf"
+        default: false
+        type: boolean
+      toward_ninf:
+        description: "Округление к -inf"
+        default: false
+        type: boolean
+              
+      print:
+        description: "Тест на вывод"
+        required: true
+        default: "Только фиксированная точка"
+        type: choice
+        options:
+        - "Только фиксированная точка"
+        - "Только плавающая точка"
+        - "Фиксированная и плавающая точка"
+
+      fixed_op:
+        description: "Тест с + (фиксированная точка)"
+        default: false
+        type: boolean        
+      floating_op:
+        description: "Тест с +* (плавающая точка)"
+        default: false
+        type: boolean       
+      half_op:
+        description: "Тест с * и выводом (плавающая точка с половинной точностью)"
+        default: false
+        type: boolean     
+      floating_special:
+        description: "Тест на специальные случаи с плавающей точкой"
+        default: false
+        type: boolean
+  
+env:
+  #C_LINUX: "clang(++)"
+  C_FLAG_CLANG: "-std=c2x"
+  CPP_FLAG_CLANG: "-std=c++20"
+  C_ARGS_CLANG: "-O2 -mf16c -Werror=return-type -Werror=strict-prototypes -Wvla -Wunused-variable -o "
+  
+  #C_WINDOWS: "cl.exe"
+  C_FLAG_CL: "/std:c17"
+  CPP_FLAG_CL: "/std:c++latest"
+  C_ARGS_CL: "-D _CRT_SECURE_NO_WARNINGS -D _USE_MATH_DEFINES -O2 /Fe:"
+
+  C_FILES: " -I./include $((Get-ChildItem -Path . -Include @('*.c', '*.cpp') -Recurse -ErrorAction SilentlyContinue -Force).FullName)"  
+  BUILDLOG: "build.log"
+  EXE: __test.exe
+  
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  buildtest:
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-24.04, windows-latest] #
+        compiler: [clang, cl]
+        exclude:
+          - os: ubuntu-24.04
+            compiler: cl
+    
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 4
+    env:    
+      STUPID_LINUX_LIBM: $(If ('${{ matrix.os }}' -eq 'windows-latest') {''} Else {'-lm'})
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: init
+        id: init
+        run: |
+          echo "# Parameters" >> $env:GITHUB_STEP_SUMMARY  
+          echo " Округление к 0 (0) - toward_zero: $${{ inputs.toward_zero }}" >> $env:GITHUB_STEP_SUMMARY
+          echo " Округление к ближайшему чётному (1) - toward_nearest_even: $${{ inputs.toward_nearest_even }}" >> $env:GITHUB_STEP_SUMMARY
+          echo " Округление к +inf (2) - toward_pinf: $${{ inputs.toward_pinf }}" >> $env:GITHUB_STEP_SUMMARY
+          echo " Округление к -inf (3) - toward_ninf: $${{ inputs.toward_ninf }}" >> $env:GITHUB_STEP_SUMMARY
+          echo " Тест на вывод - print: ${{ inputs.print }}" >> $env:GITHUB_STEP_SUMMARY
+          echo " Тест с + (фиксированная точка) - fixed_op: $${{ inputs.fixed_op }}" >> $env:GITHUB_STEP_SUMMARY
+          echo " Тест с * (плавающая точка) - floating_op: $${{ inputs.floating_op }}" >> $env:GITHUB_STEP_SUMMARY
+          echo " Тест с * (плавающая точка с половинной точностью) - half_op: $${{ inputs.half_op }}" >> $env:GITHUB_STEP_SUMMARY
+          echo " Тест на специальные случаи с плавающей точкой - floating_special: $${{ inputs.floating_special }}" >> $env:GITHUB_STEP_SUMMARY
+          
+      - name: detect_lang
+        id: detect_lang
+        run: | 
+          echo "# Detect language" >> $env:GITHUB_STEP_SUMMARY
+          $ErrorActionPreference = 'SilentlyContinue'
+          $cpp = Get-ChildItem -Force -File -Name main.cpp
+          $c = Get-ChildItem -Force -File -Name main.c
+
+          "::group::debug info"
+          echo "cpp=$cpp $($cpp.GetType()) $($cpp.GetType() -eq [String])"
+          echo "c=$c $($c.GetType()) $($c.GetType() -eq [String])"
+          "::endgroup::" 
+
+          if ($cpp.GetType() -eq [String])
+          {
+              $version = $(clang++ --version) -join "`n"
+              echo "Detect ✅: C++">> $env:GITHUB_STEP_SUMMARY
+                echo "lang=1" >> $env:GITHUB_OUTPUT      
+              exit(0)
+          }
+          if ($c.GetType() -eq [String])
+          {
+              $version = $(clang --version) -join "`n"
+              echo "Detect ✅: C">> $env:GITHUB_STEP_SUMMARY
+                echo "lang=2" >> $env:GITHUB_OUTPUT      
+              exit(0)
+          }
+          echo "Detect failed ❌">> $env:GITHUB_STEP_SUMMARY             
+          exit(1)
+          
+      - name: setup-cpp
+        if: ${{ contains(matrix.os, 'ubuntu0') }}
+        uses: aminya/setup-cpp@v1
+        with:
+          compiler: llvm-18.0.0
+          vcvarsall: ${{ contains(matrix.os, 'windows') }}  
+      
+      - name: build
+        id: build
+        run: |   
+          echo "#### checking commit: $(git log -n1)" >> $env:GITHUB_STEP_SUMMARY  
+          
+          try 
+          {
+            $ErrorActionPreference = 'SilentlyContinue'
+            $version = ""
+            
+            if ('${{ matrix.compiler }}' -eq 'cl') 
+            {
+              Push-Location
+              & 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Launch-VsDevShell.ps1'
+              #& 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat'
+              Pop-Location
+
+              if (${{ steps.detect_lang.outputs.lang }} -eq 2)  #C
+              { & ${{ matrix.compiler }} ${{env.C_FLAG_CL}}  ${{env.C_ARGS_CL}} ${{env.EXE}} ${{env.C_FILES}} *>&1 > ${{env.BUILDLOG}} }
+              else
+              { & ${{ matrix.compiler }} ${{env.CPP_FLAG_CL}}  ${{env.C_ARGS_CL}} ${{env.EXE}} ${{env.C_FILES}} *>&1 > ${{env.BUILDLOG}} }
+            } 
+            else 
+            {
+              $version = $(${{ matrix.compiler }} --version) -join "`n"              
+              # print cm version
+              echo '```' >> $env:GITHUB_STEP_SUMMARY
+              echo "$($version)">> $env:GITHUB_STEP_SUMMARY
+              echo '```' >> $env:GITHUB_STEP_SUMMARY
+              
+              if (${{ steps.detect_lang.outputs.lang }} -eq 2)  #C
+              { & ${{ matrix.compiler }} ${{env.C_FLAG_CLANG}} ${{env.STUPID_LINUX_LIBM}} ${{env.C_ARGS_CLANG}} ${{env.EXE}} ${{env.C_FILES}} *>&1 > ${{env.BUILDLOG}} }
+              else
+              { & ${{ matrix.compiler }}++ ${{env.CPP_FLAG_CLANG}} ${{env.C_ARGS_CLANG}} ${{env.EXE}} ${{env.C_FILES}} *>&1 > ${{env.BUILDLOG}} }
+            }    
+          } 
+          catch 
+          {
+            Write-Output "::debug::build failed"
+            $build_exit_code = $LastExitCode
+            Write-Output "❌ build failed!"
+            echo "# Build: 
+               failed" >> $env:GITHUB_STEP_SUMMARY
+            echo "Build exit code: $build_exit_code" >> $env:GITHUB_STEP_SUMMARY
+          } 
+          finally 
+          { 
+            $blog = "$(Get-Content ${{env.BUILDLOG}} -Raw)"
+            $blog = if($blog -eq "") { '<emplty>' } else { $blog }
+            $blog1 = $blog.replace("`nMicrosoft (R)", "`n`nMicrosoft (R)")
+
+            echo "# Build log:" >> $env:GITHUB_STEP_SUMMARY
+            echo '```' >> $env:GITHUB_STEP_SUMMARY
+            "$blog1" >> $env:GITHUB_STEP_SUMMARY
+            echo '```' >> $env:GITHUB_STEP_SUMMARY
+              
+            "::group::Build log"
+            echo $blog1
+            ls
+            echo "::endgroup::" 
+          }
+
+          exit($build_exit_code + -not (Test-Path -Path "./${{env.EXE}}" -PathType Leaf))
+                         
+      - name: tests
+        id: tests
+        run: | 
+          $tests = @()
+
+          $tests += New-Object PSObject -Property @{ name="Фикс. точка: вывод с округлением 0"; active="${{inputs.print}}" -ne "Тольцо плавающая точка" -and $${{inputs.toward_zero}}; argv="16.12 0 0x17360"; ref="23.210" }  
+          $tests += New-Object PSObject -Property @{ name="Фикс. точка: вывод с округлением 1"; active="${{inputs.print}}" -ne "Тольцо плавающая точка" -and $${{inputs.toward_nearest_even}}; argv="16.16 1 0x173600"; ref="23.211" }
+          $tests += New-Object PSObject -Property @{ name="Фикс. точка: вывод с округлением 2"; active="${{inputs.print}}" -ne "Тольцо плавающая точка" -and $${{inputs.toward_pinf}}; argv="8.8 2 0x9c9f"; ref="-99.378" }
+          $tests += New-Object PSObject -Property @{ name="Фикс. точка: вывод с округлением 3"; active="${{inputs.print}}" -ne "Тольцо плавающая точка" -and $${{inputs.toward_ninf}}; argv="8.8 3 0x9c9f"; ref="-99.379" }
+          $tests += New-Object PSObject -Property @{ name="Фикс. точка: + с округлением 0"; active=$${{inputs.toward_zero}} -and $${{inputs.fixed_op}}; argv="8.8 0 0x9c9f + 0x1736"; ref="-76.167" }
+          $tests += New-Object PSObject -Property @{ name="Фикс. точка: + с округлением 1"; active=$${{inputs.toward_nearest_even}} -and $${{inputs.fixed_op}}; argv="8.8 1 0xdc9f + 0xd736"; ref="-76.168" } #mod
+          $tests += New-Object PSObject -Property @{ name="Фикс. точка: + с округлением 2"; active=$${{inputs.toward_pinf}} -and $${{inputs.fixed_op}}; argv="16.16 2 0x6f7600 + 0x173600"; ref="134.672" }
+          $tests += New-Object PSObject -Property @{ name="Фикс. точка: + с округлением 3"; active=$${{inputs.toward_ninf}} -and $${{inputs.fixed_op}}; argv="16.16 3 0x6f7600 + 0x173600"; ref="134.671" }
+          
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): вывод с округлением 0"; active="${{inputs.print}}" -ne "Только фиксированная точка" -and $${{inputs.toward_zero}}; argv="f 0 0xB9CD542"; ref="0x1.39aa84p-104" }
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): вывод с округлением 1"; active="${{inputs.print}}" -ne "Только фиксированная точка" -and $${{inputs.toward_nearest_even}}; argv="f 1 0x3"; ref="0x1.800000p-148" } #denorm
+          
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): * с округлением 0"; active=$${{inputs.floating_op}} -and $${{inputs.toward_zero}}; argv="f 0 0x414587dd * 0x42ebf110"; ref="0x1.6c1b72p+10" }  
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): * с округлением 1"; active=$${{inputs.floating_op}} -and $${{inputs.toward_nearest_even}}; argv="f 1 0x414587dd * 0x42ebf110"; ref="0x1.6c1b72p+10" }
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): * с округлением 2"; active=$${{inputs.floating_op}} -and $${{inputs.toward_pinf}}; argv="f 2 0x414587dd * 0x42ebf110"; ref="0x1.6c1b74p+10" }
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): * с округлением 3"; active=$${{inputs.floating_op}} -and $${{inputs.toward_ninf}}; argv="f 3 0x414587dd * 0x42ebf110"; ref="0x1.6c1b72p+10" } 
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): + с округлением 0"; active=$${{inputs.floating_op}} -and $${{inputs.toward_zero}}; argv="f 0 0x414587dd + 0x42ebf110"; ref="0x1.04a20ap+7" }  
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): + с округлением 1"; active=$${{inputs.floating_op}} -and $${{inputs.toward_nearest_even}}; argv="f 1 0x414587dd + 0x42ebf110"; ref="0x1.04a20cp+7" }
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): + с округлением 2"; active=$${{inputs.floating_op}} -and $${{inputs.toward_pinf}}; argv="f 2 0x414587dd + 0x42ebf110"; ref="0x1.04a20cp+7" }
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): + с округлением 3"; active=$${{inputs.floating_op}} -and $${{inputs.toward_ninf}}; argv="f 3 0x414587dd + 0x42ebf110"; ref="0x1.04a20ap+7" }
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (half): * с округлением 0"; active=$${{inputs.half_op}} -and $${{inputs.toward_zero}}; argv="h 0 0x4145 * 0x42eb"; ref="0x1.238p+3" }
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (half): * с округлением 1"; active=$${{inputs.half_op}} -and $${{inputs.toward_nearest_even}}; argv="h 1 0x4145 * 0x42eb"; ref="0x1.23cp+3" }
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (half): * с округлением 2"; active=$${{inputs.half_op}} -and $${{inputs.toward_pinf}}; argv="h 2 0x4145 * 0x42eb"; ref="0x1.23cp+3" }
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (half): * с округлением 3"; active=$${{inputs.half_op}} -and $${{inputs.toward_ninf}}; argv="h 3 0x4145 * 0x42eb"; ref="0x1.238p+3" }
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (half): -0 + 0"; active=$${{inputs.half_op}} -and $${{inputs.floating_special}}; argv="h 0 0x8000 + 0x0"; ref="0x0.000p+0" }
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (half): 0"; active=${{inputs.half_op}} -and $${{inputs.floating_special}}; argv="h 0 0x0"; ref="0x0.000p+0" }
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): 0"; active=("${{inputs.print}}" -ne "Только фиксированная точка") -and $${{inputs.floating_special}}; argv="f 0 0x0"; ref="0x0.000000p+0" }  
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): inf"; active=("${{inputs.print}}" -ne "Только фиксированная точка") -and $${{inputs.floating_special}}; argv="f 0 0x7f800000"; ref="inf" }
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): -inf"; active=("${{inputs.print}}" -ne "Только фиксированная точка") -and $${{inputs.floating_special}}; argv="f 0 0xff800000"; ref="-inf" }  
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): nan"; active=("${{inputs.print}}" -ne "Только фиксированная точка") -and $${{inputs.floating_special}}; argv="f 0 0x7fc00000"; ref="nan" } 
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): / inf"; active=$${{inputs.floating_op}} -and $${{inputs.floating_special}}; argv="f 0 0x1 / 0x0"; ref="inf" }
+          $tests += New-Object PSObject -Property @{ name="Плав. точка (single): / nan"; active=$${{inputs.floating_op}} -and $${{inputs.floating_special}}; argv="f 0 0xff800000 / 0x7f800000"; ref="nan" }
+                  
+          $test_exit_code = $tests.Count
+
+          $it = 0
+          $logs = @()
+          foreach ($test in $tests)
+          {
+            if (-not $test.active) 
+            {
+              $test_exit_code -= 1
+              continue
+            }
+            $it += 1
+            "::group::Output log test $it : $($test.name)"
+            
+            $test_input = $test.argv.split() #| ForEach { "$_" } 
+            $test_ref = $test.ref
+
+            echo "test_input"
+            $test_input
+            echo "test_ref"
+            $test_ref
+            echo "detect_lang.outputs.lang"
+            ${{ steps.detect_lang.outputs.lang }}
+            
+            $pr = Start-Process "./${{env.EXE}}" -PassThru -ArgumentList "$test_input" -RedirectStandardOutput "stdout.log" -RedirectStandardError "stderr.log" -NoNewWindow
+            
+            Wait-Process -InputObject $pr
+            $exit_code_p = [int]$pr.ExitCode    
+            
+            $stderr = if ((& Test-Path -Path stderr.log -PathType Leaf)) { $(Get-Content stderr.log -Raw) } else {''}
+            echo "`nstderr"
+            $stderr
+            Test-Path -Path stderr.log -PathType Leaf
+            $stdout = if ((& Test-Path -Path stdout.log -PathType Leaf)) { $(Get-Content stdout.log -Raw) } else {''}
+            echo "`nstdout"
+            $stdout
+                   
+            $result = ""
+            $error_flag = $false
+            if ((& Test-Path -Path stderr.log -PathType Leaf) -and ($stderr.Length -ne 0))
+            {
+              $result = "❌ [ERROR] Stderr is not empty [program completed with code $exit_code_p]" 
+              $error_flag = $true
+            } 
+            if ($exit_code_p -ne 0)
+            {             
+              $result = "❌ [ERROR] Program completed with code $exit_code_p (!= 0)"
+              $error_flag = $true
+            }   
+            if (-not (& Test-Path -Path stdout.log -PathType Leaf) -or ($stdout.Length -eq 0))
+            {
+              $result = "❌ [ERROR] Stdout is empty (program completed with code $exit_code_p)"
+              $error_flag = $true   
+            }
+            if (-not $error_flag)
+            {
+              $stdout = $stdout.split([System.Environment]::NewLine, [System.StringSplitOptions]::RemoveEmptyEntries)[0] 
+              $res_test = $stdout -eq $test_ref
+              if ($res_test) 
+              { 
+                $result = "✅ PASSED"       
+                $test_exit_code -= 1
+              }
+              else
+              {
+                $result = "❌ FAILED [output != expected]"   
+              } 
+            }
+            else
+            {                                           
+              echo "[#$($it). $($test.name)] stderr (program completed with code $exit_code_p):" >> $env:GITHUB_STEP_SUMMARY              
+              echo '```' >> $env:GITHUB_STEP_SUMMARY
+              "$stderr" >> $env:GITHUB_STEP_SUMMARY
+              echo '```' >> $env:GITHUB_STEP_SUMMARY
+            }
+            echo "[debug] error codes: $test_exit_code" 
+
+            # echo '```' >> $env:GITHUB_STEP_SUMMARY
+            # echo $result >> $env:GITHUB_STEP_SUMMARY   
+            # echo '```' >> $env:GITHUB_STEP_SUMMARY  
+
+            $stdout = if ($stdout -ne '') { $stdout.Trim() } else { '' }
+            $logs += "| $it | $($test.name) | <code>$($test.argv)</code> | <code>$($test_ref)</code> | <code>$($stdout)</code> | <code>$exit_code_p</code> | <code>$result</code> |"       
+          }
+          "::endgroup::"
+          
+          echo "| # | test name | input (argv) | expected | output | exit code | result |" >> $env:GITHUB_STEP_SUMMARY   
+          echo "|  --- | --- | --- | --- | --- | --- | --- |" >> $env:GITHUB_STEP_SUMMARY    
+          foreach ($log in $logs)
+          {
+              echo $log >> $env:GITHUB_STEP_SUMMARY  
+          }
+          
+          exit($test_exit_code)
+    
